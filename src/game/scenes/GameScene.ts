@@ -1,11 +1,12 @@
 import Phaser from "phaser";
 import {
+  DOOR_CELL,
   GUARD_START,
   GRID_HEIGHT,
   GRID_WIDTH,
-  LAB_MAP,
   PLAYER_START,
   TILE_SIZE,
+  labMapWithDoor,
 } from "../../application/simulation/labLevel";
 import { calculateRoute } from "../../application/simulation/navigationDemo";
 import {
@@ -20,6 +21,29 @@ import { advanceAlongPath } from "../../domain/navigation/pathFollower";
 import type { SearchAlgorithm, SearchResult, SearchStatus } from "../../domain/navigation/search";
 import { timeSinceLastPerception } from "../../domain/perception/memory";
 import type { VisionReason, VisionResult } from "../../domain/perception/perception";
+import { visionConeAppearance } from "../presentation/visionCone";
+import {
+  ALERT_FLASH_MS,
+  ALERT_SHAKE_INTENSITY,
+  ALERT_SHAKE_MS,
+  alertPhase,
+  zoomDuringAlert,
+} from "../presentation/alertFeedback";
+import {
+  advanceTension,
+  initialTensionState,
+  tensionScroll,
+  tensionZoom,
+  type TensionState,
+} from "../presentation/cameraTension";
+import {
+  LURE_DURATION_MS,
+  LURE_RADIUS,
+  deployLure,
+  initialLureState,
+  lureStatus,
+  type LureState,
+} from "../presentation/soundLure";
 
 const PLAYER_SPEED = 190;
 const GUARD_SPEED = 115;
@@ -40,6 +64,7 @@ const VISION_LABELS: Readonly<Record<VisionReason, string>> = {
   occluded: "OCLUIDO",
   "invalid-facing": "DIRECCION INVALIDA",
 };
+const BASE_SCROLL = { x: 0, y: 0 };
 
 export class GameScene extends Phaser.Scene {
   private player!: Phaser.GameObjects.Rectangle;
@@ -53,6 +78,7 @@ export class GameScene extends Phaser.Scene {
   private reset!: Phaser.Input.Keyboard.Key;
   private toggleAlgorithm!: Phaser.Input.Keyboard.Key;
   private emitSound!: Phaser.Input.Keyboard.Key;
+  private deployLureKey!: Phaser.Input.Keyboard.Key;
   private navigationGraphics!: Phaser.GameObjects.Graphics;
   private perceptionGraphics!: Phaser.GameObjects.Graphics;
   private targetMarker!: Phaser.GameObjects.Arc;
@@ -65,6 +91,16 @@ export class GameScene extends Phaser.Scene {
   private guardWaypoints: readonly Vector2[] = [];
   private nextWaypoint = 0;
   private perceptionState: PerceptionSimulationState = initialPerceptionState();
+  private visionVisible = false;
+  private visionPreviousVisible = false;
+  private visionChangedAtMs = 0;
+  private alertStartedAtMs: number | null = null;
+  private tensionState: TensionState = initialTensionState();
+  private lureState: LureState = initialLureState();
+  private lureHud!: Phaser.GameObjects.Text;
+  private doorOpen = false;
+  private walls!: Phaser.Physics.Arcade.StaticGroup;
+  private doorMarker!: Phaser.GameObjects.Arc;
 
   public constructor() {
     super("GameScene");
@@ -77,17 +113,30 @@ export class GameScene extends Phaser.Scene {
     this.guardWaypoints = [];
     this.nextWaypoint = 0;
     this.perceptionState = initialPerceptionState();
+    this.visionVisible = false;
+    this.visionPreviousVisible = false;
+    this.visionChangedAtMs = 0;
+    this.alertStartedAtMs = null;
+    this.tensionState = initialTensionState();
+    this.lureState = initialLureState();
+    this.doorOpen = false;
     this.cameras.main.setBackgroundColor("#10161c");
+    this.cameras.main.resetFX();
+    this.cameras.main.setZoom(1);
+    this.cameras.main.setScroll(BASE_SCROLL.x, BASE_SCROLL.y);
     this.drawGrid();
 
-    const walls = this.physics.add.staticGroup();
+    if (this.walls) {
+      this.walls.destroy(true);
+    }
+    this.walls = this.physics.add.staticGroup();
     for (let y = 0; y < GRID_HEIGHT; y += 1) {
       for (let x = 0; x < GRID_WIDTH; x += 1) {
-        if (!isWalkable(LAB_MAP, { x, y })) {
+        if (!isWalkable(labMapWithDoor(this.doorOpen), { x, y })) {
           const center = cellCenter({ x, y }, TILE_SIZE);
           const wall = this.add.rectangle(center.x, center.y, TILE_SIZE, TILE_SIZE, 0x27333d);
           wall.setStrokeStyle(1, 0x3a4c58);
-          walls.add(wall);
+          this.walls.add(wall);
         }
       }
     }
@@ -99,7 +148,7 @@ export class GameScene extends Phaser.Scene {
     this.physics.add.existing(this.player);
     this.playerBody = this.player.body as Phaser.Physics.Arcade.Body;
     this.playerBody.setCollideWorldBounds(true);
-    this.physics.add.collider(this.player, walls);
+    this.physics.add.collider(this.player, this.walls);
 
     const keyboard = this.input.keyboard;
     if (!keyboard) {
@@ -114,6 +163,7 @@ export class GameScene extends Phaser.Scene {
     this.reset = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.R);
     this.toggleAlgorithm = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE);
     this.emitSound = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.Q);
+    this.deployLureKey = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.E);
 
     this.perceptionGraphics = this.add.graphics().setDepth(1);
     this.navigationGraphics = this.add.graphics().setDepth(2);
@@ -152,9 +202,27 @@ export class GameScene extends Phaser.Scene {
       .setOrigin(1, 0)
       .setDepth(10);
 
+    this.lureHud = this.add
+      .text(16, GRID_HEIGHT * TILE_SIZE - 14, "", {
+        backgroundColor: "#10161ccc",
+        color: "#d9e4ea",
+        fontFamily: "monospace",
+        fontSize: "13px",
+        padding: { x: 8, y: 6 },
+      })
+      .setOrigin(0, 1)
+      .setDepth(10);
+
+    const doorPos = cellCenter(DOOR_CELL, TILE_SIZE);
+    this.doorMarker = this.add
+      .circle(doorPos.x, doorPos.y, 8, 0x000000, 0)
+      .setStrokeStyle(3, 0xe5b454)
+      .setDepth(5);
+
     this.input.on("pointerdown", this.handlePointerDown, this);
     this.renderNavigation();
     this.updatePerception(0);
+    this.updateLureHud(0);
   }
 
   public update(time: number, delta: number): void {
@@ -168,6 +236,20 @@ export class GameScene extends Phaser.Scene {
       this.renderNavigation();
     }
 
+    if (Phaser.Input.Keyboard.JustDown(this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.F))) {
+      const doorPos = cellCenter(DOOR_CELL, TILE_SIZE);
+      const dx = Math.abs(this.player.x - doorPos.x);
+      const dy = Math.abs(this.player.y - doorPos.y);
+      const manhattan = Math.floor(dx / TILE_SIZE + 0.5) + Math.floor(dy / TILE_SIZE + 0.5);
+      const playerCell = worldToCell({ x: this.player.x, y: this.player.y }, TILE_SIZE);
+      const onDoor = playerCell.x === DOOR_CELL.x && playerCell.y === DOOR_CELL.y;
+      if (manhattan <= 1 && !onDoor) {
+        this.doorOpen = !this.doorOpen;
+        this.rebuildWalls();
+        this.renderNavigation();
+      }
+    }
+
     if (Phaser.Input.Keyboard.JustDown(this.emitSound)) {
       this.perceptionState = withSoundEvent(this.perceptionState, {
         position: { x: this.player.x, y: this.player.y },
@@ -175,6 +257,25 @@ export class GameScene extends Phaser.Scene {
         emittedAtMs: time,
         durationMs: SOUND_DURATION_MS,
       });
+    }
+
+    if (Phaser.Input.Keyboard.JustDown(this.deployLureKey)) {
+      const pointer = this.input.activePointer;
+      const result = deployLure(
+        this.lureState,
+        { x: this.player.x, y: this.player.y },
+        { x: pointer.worldX, y: pointer.worldY },
+        time,
+      );
+      if (result.deployed) {
+        this.lureState = result.state;
+        this.perceptionState = withSoundEvent(this.perceptionState, {
+          position: result.position,
+          radius: LURE_RADIUS,
+          emittedAtMs: time,
+          durationMs: LURE_DURATION_MS,
+        });
+      }
     }
 
     const horizontal = Number(this.cursors.right.isDown || this.moveRight.isDown)
@@ -190,6 +291,36 @@ export class GameScene extends Phaser.Scene {
     this.playerBody.setVelocity(velocity.x, velocity.y);
     this.updateGuardMovement(delta);
     this.updatePerception(time);
+    this.updateCamera(time, delta);
+    this.updateLureHud(time);
+  }
+
+  private updateLureHud(time: number): void {
+    const status = lureStatus(this.lureState, time);
+    const readiness = status.cooldownRemainingMs > 0
+      ? `ENFRIANDO ${(status.cooldownRemainingMs / 1000).toFixed(1)}S`
+      : "LISTO";
+    this.lureHud.setText(`SENUELOS ${status.charges} ${readiness}`);
+  }
+
+  private rebuildWalls(): void {
+    if (this.walls) {
+      this.walls.destroy(true);
+    }
+    this.walls = this.physics.add.staticGroup();
+    for (let y = 0; y < GRID_HEIGHT; y += 1) {
+      for (let x = 0; x < GRID_WIDTH; x += 1) {
+        if (!isWalkable(labMapWithDoor(this.doorOpen), { x, y })) {
+          const center = cellCenter({ x, y }, TILE_SIZE);
+          const wall = this.add.rectangle(center.x, center.y, TILE_SIZE, TILE_SIZE, 0x27333d);
+          wall.setStrokeStyle(1, 0x3a4c58);
+          this.walls.add(wall);
+        }
+      }
+    }
+    if (this.playerBody) {
+      this.physics.add.collider(this.player, this.walls);
+    }
   }
 
   private drawGrid(): void {
@@ -212,7 +343,7 @@ export class GameScene extends Phaser.Scene {
   private renderNavigation(): void {
     const guardCell = worldToCell({ x: this.guard.x, y: this.guard.y }, TILE_SIZE);
     const result = calculateRoute(
-      LAB_MAP,
+      labMapWithDoor(this.doorOpen),
       guardCell,
       this.navigationGoal,
       this.navigationAlgorithm,
@@ -281,29 +412,74 @@ export class GameScene extends Phaser.Scene {
   }
 
   private updatePerception(time: number): void {
-    const observer = { x: this.guard.x, y: this.guard.y };
-    const target = { x: this.player.x, y: this.player.y };
-    const frame = updatePerceptionSimulation(this.perceptionState, {
-      map: LAB_MAP,
+    const perception = updatePerceptionSimulation(this.perceptionState, {
+      map: labMapWithDoor(this.doorOpen),
       tileSize: TILE_SIZE,
-      observer,
+      observer: { x: this.guard.x, y: this.guard.y },
       facing: this.guardFacing,
-      target,
+      target: { x: this.player.x, y: this.player.y },
       visionRange: VISION_RANGE,
       fieldOfViewRadians: FIELD_OF_VIEW,
       timeMs: time,
     });
-    this.perceptionState = frame.state;
+    this.perceptionState = perception.state;
 
-    this.drawPerception(frame.vision);
-    this.updateTelemetry(time, frame.vision, frame.soundHeard);
+    if (perception.vision.visible !== this.visionVisible) {
+      this.visionPreviousVisible = this.visionVisible;
+      this.visionVisible = perception.vision.visible;
+      this.visionChangedAtMs = time;
+      if (perception.vision.visible) {
+        this.alertStartedAtMs = time;
+        this.cameras.main.shake(ALERT_SHAKE_MS, ALERT_SHAKE_INTENSITY);
+        this.cameras.main.flash(ALERT_FLASH_MS, 255, 255, 255);
+      }
+    }
+
+    this.drawPerception(time);
+    this.updateTelemetry(time, perception.vision, perception.soundHeard);
+    this.updateDoorMarker();
   }
 
-  private drawPerception(vision: VisionResult): void {
+  private updateCamera(time: number, delta: number): void {
+    this.tensionState = advanceTension(this.tensionState, this.visionVisible, delta);
+
+    const alertStartedAtMs = this.alertStartedAtMs;
+    const alertActive = alertStartedAtMs !== null
+      && alertPhase(alertStartedAtMs, time).active;
+
+    if (alertActive) {
+      this.cameras.main.setZoom(zoomDuringAlert(alertStartedAtMs, time));
+    } else {
+      this.alertStartedAtMs = null;
+      this.cameras.main.setZoom(tensionZoom(this.tensionState.progress));
+    }
+
+    const scroll = tensionScroll(
+      BASE_SCROLL,
+      { x: this.guard.x, y: this.guard.y },
+      { x: this.player.x, y: this.player.y },
+      this.tensionState.progress,
+    );
+    this.cameras.main.setScroll(scroll.x, scroll.y);
+  }
+
+  private updateDoorMarker(): void {
+    const doorPos = cellCenter(DOOR_CELL, TILE_SIZE);
+    this.doorMarker.setPosition(doorPos.x, doorPos.y);
+    this.doorMarker.setStrokeStyle(3, this.doorOpen ? 0x73c991 : 0xe5b454);
+  }
+
+  private drawPerception(timeMs: number): void {
     this.perceptionGraphics.clear();
     const facingAngle = Math.atan2(this.guardFacing.y, this.guardFacing.x);
     const halfFieldOfView = FIELD_OF_VIEW / 2;
-    this.perceptionGraphics.fillStyle(vision.visible ? 0x73c991 : 0x6b8afd, 0.16);
+    const appearance = visionConeAppearance(
+      this.visionVisible,
+      this.visionPreviousVisible,
+      this.visionChangedAtMs,
+      timeMs,
+    );
+    this.perceptionGraphics.fillStyle(appearance.fill, appearance.alpha);
     this.perceptionGraphics.beginPath();
     this.perceptionGraphics.moveTo(this.guard.x, this.guard.y);
     this.perceptionGraphics.arc(
@@ -315,6 +491,8 @@ export class GameScene extends Phaser.Scene {
     );
     this.perceptionGraphics.closePath();
     this.perceptionGraphics.fillPath();
+    this.perceptionGraphics.lineStyle(2, 0xd7e1ff, 0.9);
+    this.perceptionGraphics.strokePath();
 
     if (this.perceptionState.soundEvent) {
       this.perceptionGraphics.lineStyle(2, 0xe5b454, 0.8);
@@ -346,6 +524,7 @@ export class GameScene extends Phaser.Scene {
       `vision ${VISION_LABELS[vision.reason]}`,
       `sonido ${sound}`,
       memory,
+      `PUERTA ${this.doorOpen ? "ABIERTA" : "CERRADA"}`,
     ]);
   }
 }

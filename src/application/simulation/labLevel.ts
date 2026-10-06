@@ -1,10 +1,12 @@
-import { createGridMap, type GridPoint } from "../../domain/model/grid";
+import { createGridMap, type GridMap, type GridPoint } from "../../domain/model/grid";
 
 export const TILE_SIZE = 32;
 export const GRID_WIDTH = 30;
 export const GRID_HEIGHT = 20;
 export const PLAYER_START: GridPoint = { x: 2, y: 2 };
 export const GUARD_START: GridPoint = { x: 27, y: 17 };
+export const DOOR_CELL: GridPoint = { x: 19, y: 7 };
+export const DOOR_OPEN = false;
 
 interface BlockedRectangle {
   readonly x: number;
@@ -43,4 +45,14 @@ function expandAreas(areas: readonly BlockedRectangle[]): GridPoint[] {
   return cells;
 }
 
-export const LAB_MAP = createGridMap(GRID_WIDTH, GRID_HEIGHT, expandAreas(BLOCKED_AREAS));
+export function labMapWithDoor(open: boolean): GridMap {
+  const blocked = expandAreas(BLOCKED_AREAS).filter(
+    (cell) => !(cell.x === DOOR_CELL.x && cell.y === DOOR_CELL.y),
+  );
+  if (!open) {
+    blocked.push(DOOR_CELL);
+  }
+  return createGridMap(GRID_WIDTH, GRID_HEIGHT, blocked);
+}
+
+export const LAB_MAP = labMapWithDoor(false);
